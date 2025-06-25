@@ -20,6 +20,8 @@ from scrapy.utils.misc import load_object
 from scrapy.utils.python import global_object_name
 from scrapy.utils.response import response_status_message
 
+from weakref import WeakKeyDictionary
+
 if TYPE_CHECKING:
     # typing.Self requires Python 3.11
     from typing_extensions import Self
@@ -133,6 +135,7 @@ class RetryMiddleware:
             load_object(x) if isinstance(x, str) else x
             for x in settings.getlist("RETRY_EXCEPTIONS")
         )
+        self._requests_df_set_by_retry = WeakKeyDictionary()
 
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
@@ -142,7 +145,16 @@ class RetryMiddleware:
         self, request: Request, response: Response, spider: Spider
     ) -> Request | Response:
         if request.meta.get("dont_retry", False):
+            # NEW LOGIC (ensure we clean up if dont_retry was set elsewhere)
+            if request in self._requests_df_set_by_retry:
+                del self._requests_df_set_by_retry[request]
             return response
+
+        if request in self._requests_df_set_by_retry:
+            request.dont_filter = False
+            # Remove the request from our tracking dictionary
+            del self._requests_df_set_by_retry[request]
+
         if response.status in self.retry_http_codes:
             reason = response_status_message(response.status)
             return self._retry(request, reason, spider) or response
@@ -165,10 +177,15 @@ class RetryMiddleware:
     ) -> Request | None:
         max_retry_times = request.meta.get("max_retry_times", self.max_retry_times)
         priority_adjust = request.meta.get("priority_adjust", self.priority_adjust)
-        return get_retry_request(
+        new_request = get_retry_request(
             request,
             reason=reason,
             spider=spider,
             max_retry_times=max_retry_times,
             priority_adjust=priority_adjust,
         )
+        if new_request:  # If a new retry request was successfully created
+            self._requests_df_set_by_retry[new_request] = True
+
+
+        return new_request
